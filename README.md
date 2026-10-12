@@ -1,2 +1,2 @@
 # Launch build_exe.bat
-# (Before doing, this you must install python)
+# (Before doing this, you must install python)
