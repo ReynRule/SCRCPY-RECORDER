@@ -11,9 +11,16 @@ if not exist scrcpy\scrcpy.exe (
     exit /b 1
 )
 
+if not exist "ffmpeg\bin\ffmpeg.exe" (
+    echo ERROR: ffmpeg\bin\ffmpeg.exe not found!
+    pause
+    exit /b 1 
+)
+
 pyinstaller --noconfirm --onefile --windowed ^
-    --name Android Recorder ^
+    --name "Android Recorder" ^
     --add-data "scrcpy;scrcpy" ^
+    --add-data "ffmpeg;ffmpeg" ^
     --hidden-import PyQt6.QtCore ^
     --hidden-import PyQt6.QtWidgets ^
     --hidden-import PyQt6.QtGui ^
