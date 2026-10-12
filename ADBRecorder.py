@@ -286,21 +286,45 @@ class ScreenRecorder(QtWidgets.QWidget):
         if directory:
             self.out_dir_edit.setText(directory)
 
+    
     def load_devices(self):
         adb = self.resolve_adb()
         if not adb:
             return
+
         try:
             result = subprocess.run(
-                [adb, 'devices'], capture_output=True, text=True,
-                errors='replace', creationflags=CREATE_NO_WINDOW, timeout=30)
+                [adb, 'devices', '-l'],
+                capture_output=True,
+                text=True,
+                errors='replace',
+                creationflags=CREATE_NO_WINDOW,
+                timeout=30
+            )
+
+            if result.returncode != 0:
+                return
+
         except (OSError, subprocess.SubprocessError):
             return
+
+        previous_device = self.device_combo.currentText()
+
         self.device_combo.clear()
+
         for line in result.stdout.splitlines()[1:]:
             parts = line.split()
+
             if len(parts) >= 2 and parts[1] == 'device':
-                self.device_combo.addItem(parts[0])
+                serial = parts[0]
+                details = ' '.join(parts[2:])
+                label = f'{serial} ({details})' if details else serial
+                self.device_combo.addItem(label, serial)
+
+        # 기존에 선택했던 장치가 아직 연결되어 있으면 선택 유지
+        index = self.device_combo.findData(previous_device.split(' (')[0])
+        if index >= 0:
+            self.device_combo.setCurrentIndex(index)
 
     # ----------------------------------------------------------- recording
     def start_recording(self):
