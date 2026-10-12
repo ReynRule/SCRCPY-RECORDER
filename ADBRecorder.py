@@ -93,13 +93,28 @@ class ScreenRecorder(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('ADB 화면 녹화기 (scrcpy)')
-        self.setFixedSize(460, 440)
+        self.setFixedSize(460, 475)
         self.settings = QtCore.QSettings('MyCompany', 'ADBRecorder')
         self.recording = False
+        self.paused = False
         self.stop_requested = False
         self.proc = None
         self.proc_started_at = 0.0
         self.rec_started_at = 0.0
+        self._active_elapsed = 0.0
+        self._segment_started_at = 0.0
+        self._pause_intervals = []
+        self._pause_started_at = None
+        self._timeline_start = 0.0
+        self._last_display_second = -1
+        self._segment_end_reason = None
+        self._segment_index = 0
+        self._segments = []
+        self._segment_logs = []
+        self._base_out_path = None
+        self._base_log_stem = None
+        self._current_segment_path = None
+        self._current_segment_log = None
         self._forced_kill = False
         self._scrcpy_help_cache = None
         self.scrcpy_dir = ensure_scrcpy()
@@ -177,11 +192,17 @@ class ScreenRecorder(QtWidgets.QWidget):
 
         self.start_btn = QtWidgets.QPushButton('녹화 시작')
         self.start_btn.clicked.connect(self.start_recording)
-        self.stop_btn = QtWidgets.QPushButton('녹화 중지')
+        self.pause_btn = QtWidgets.QPushButton('일시 정지')
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.clicked.connect(self.toggle_pause_resume)
+        self.stop_btn = QtWidgets.QPushButton('녹화 종료 및 저장')
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_recording)
+        control_layout = QtWidgets.QHBoxLayout()
+        control_layout.addWidget(self.pause_btn)
+        control_layout.addWidget(self.stop_btn)
         layout.addWidget(self.start_btn)
-        layout.addWidget(self.stop_btn)
+        layout.addLayout(control_layout)
 
         layout.addStretch()
         self.setLayout(layout)
@@ -285,35 +306,23 @@ class ScreenRecorder(QtWidgets.QWidget):
     def start_recording(self):
         if self.recording:
             return
-
         adb = self.resolve_adb()
         scrcpy = self.resolve_scrcpy()
         device = self.device_combo.currentText()
         if not adb or not device:
-            QtWidgets.QMessageBox.warning(
-                self, '오류', 'ADB 경로나 디바이스를 확인하세요.\n에뮬레이터가 실행 중인지 확인한 뒤 새로고침하세요.')
+            QtWidgets.QMessageBox.warning(self, '오류', 'ADB 경로나 디바이스를 확인하세요. 에뮬레이터를 켠 뒤 새로고침하세요.')
             return
         if not scrcpy:
-            QtWidgets.QMessageBox.warning(
-                self, '오류', '내장 scrcpy를 찾을 수 없습니다.\n프로그램 옆에 scrcpy 폴더가 있는지 확인하세요.')
+            QtWidgets.QMessageBox.warning(self, '오류', '내장 scrcpy를 찾을 수 없습니다. scrcpy 폴더 구성을 확인하세요.')
             return
 
         help_text = self.scrcpy_help(scrcpy)
-        has_help = bool(help_text.strip())
-        has_audio_source = '--audio-source' in help_text
-        has_no_audio = '--no-audio' in help_text
-
         record_audio = self.keep_device_audio_check.isChecked()
-        if record_audio and not has_audio_source and has_help:
-            QtWidgets.QMessageBox.warning(
-                self, '옵션 미지원',
-                '현재 scrcpy 버전은 --audio-source 옵션을 지원하지 않습니다.\n'
-                'scrcpy 2.x 이상 버전을 사용하세요.')
+        if help_text.strip() and record_audio and '--audio-source' not in help_text:
+            QtWidgets.QMessageBox.warning(self, '옵션 미지원', '현재 scrcpy는 --audio-source 옵션을 지원하지 않습니다. scrcpy 2.x 이상을 사용하세요.')
             return
-        if not record_audio and not has_no_audio and has_help:
-            QtWidgets.QMessageBox.warning(
-                self, '옵션 미지원',
-                '현재 scrcpy 버전은 --no-audio 옵션을 지원하지 않습니다.')
+        if help_text.strip() and not record_audio and '--no-audio' not in help_text:
+            QtWidgets.QMessageBox.warning(self, '옵션 미지원', '현재 scrcpy는 --no-audio 옵션을 지원하지 않습니다.')
             return
 
         out_dir = self.out_dir_edit.text().strip() or app_dir()
@@ -324,71 +333,101 @@ class ScreenRecorder(QtWidgets.QWidget):
             return
 
         fmt = self.format_combo.currentText()
-        # 초 단위 이름 충돌을 피합니다.
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-        out_path = os.path.join(out_dir, f'record_{timestamp}.{fmt}')
-        log_path = os.path.join(out_dir, f'record_{timestamp}.log')
-
-        cmd = [scrcpy, '-s', device,
-               '--no-window',
-               '--no-control',
-               f'--record={out_path}',
-               f'--record-format={fmt}']
-
-        # 사용자가 테스트해 정상 동작을 확인한 방식과 동일하게 playback 소스를 사용합니다.
-        # 디바이스 ID와 출력 파일명은 선택 기기/타임스탬프로 매번 동적으로 지정됩니다.
-        if record_audio:
-            cmd += ['--audio-source=playback','--audio-codec=aac']
-            audio_mode = '기기 내부 소리 녹화 (playback)'
-        else:
-            cmd += ['--no-audio']
-            audio_mode = '소리 녹화 끔 (영상만)'
-
-        max_size = self.size_combo.currentData()
-        if max_size:
-            cmd += ['-m', str(max_size)]
-
-        env = os.environ.copy()
-        env['ADB'] = adb
-
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+        self._base_out_path = os.path.join(out_dir, f'record_{stamp}.{fmt}')
+        self._base_log_stem = os.path.join(out_dir, f'record_{stamp}')
+        # scrcpy는 녹화 내내 하나의 파일에 기록합니다. pause 구간은 종료 후 FFmpeg로 잘라냅니다.
+        self._current_segment_path = os.path.join(out_dir, f'record_{stamp}_raw.{fmt}')
+        self._current_segment_log = self._base_log_stem + '.log'
+        self._pause_intervals = []
+        self._pause_started_at = None
+        self._timeline_start = time.monotonic()
+        self._last_display_second = -1
+        self.paused = False
         self.stop_requested = False
         self.recording = True
         self.proc = None
         self._forced_kill = False
-        self.rec_started_at = time.time()
+        self._active_elapsed = 0.0
+        self._segment_started_at = self._timeline_start
+        self.rec_started_at = self._timeline_start
+
+        cmd = [scrcpy, '-s', device, '--no-window', '--no-control',
+               f'--record={self._current_segment_path}', f'--record-format={fmt}']
+        if record_audio:
+            cmd += ['--audio-source=playback', '--audio-codec=aac']
+            self._audio_mode = '기기 내부 소리 녹화 (playback/AAC)'
+        else:
+            cmd += ['--no-audio']
+            self._audio_mode = '소리 녹화 끔 (영상만)'
+        max_size = self.size_combo.currentData()
+        if max_size:
+            cmd += ['-m', str(max_size)]
+        env = os.environ.copy()
+        env['ADB'] = adb
+
         self.status_label.setText('🔴 녹화 중... 00:00:00')
         self.status_label.setStyleSheet('color: red; font-size: 16px;')
         self.start_btn.setEnabled(False)
+        self.pause_btn.setEnabled(True)
+        self.pause_btn.setText('일시 정지')
         self.stop_btn.setEnabled(True)
         self.keep_device_audio_check.setEnabled(False)
-        self.clock.start(1000)
+        # 100ms마다 단조 증가 시계를 확인하고 표시 초가 바뀔 때만 갱신해 타이머가 튀는 현상을 줄임.
+        self.clock.start(100)
+        threading.Thread(target=self.record_worker,
+                         args=(cmd, env, self._current_segment_path, self._current_segment_log, self._audio_mode),
+                         daemon=True).start()
 
-        threading.Thread(
-            target=self.record_worker,
-            args=(cmd, env, out_path, log_path, audio_mode),
-            daemon=True).start()
+    @staticmethod
+    def _format_elapsed(seconds):
+        sec = max(0, int(seconds))
+        return f'{sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}'
+
+    def _elapsed_now(self):
+        if not self._timeline_start:
+            return 0.0
+        return max(0.0, time.monotonic() - self._timeline_start)
+
+    def toggle_pause_resume(self):
+        if not self.recording or self.stop_requested:
+            return
+        if not self.paused:
+            self.paused = True
+            self._pause_started_at = self._elapsed_now()
+            self.pause_btn.setText('녹화 재개')
+            self.status_label.setStyleSheet('color: #b7791f; font-size: 16px;')
+        else:
+            now = self._elapsed_now()
+            if self._pause_started_at is not None:
+                self._pause_intervals.append((self._pause_started_at, now))
+            self._pause_started_at = None
+            self.paused = False
+            self.pause_btn.setText('일시 정지')
+            self.status_label.setStyleSheet('color: red; font-size: 16px;')
+        self.update_clock()
 
     def record_worker(self, cmd, env, out_path, log_path, audio_mode):
         tail = deque(maxlen=35)
         try:
             kwargs = {}
             if IS_WIN:
-                # Ctrl+C를 보낼 scrcpy 콘솔은 별도 생성하되 화면에는 표시하지 않습니다.
+                # scrcpy에는 Ctrl+C를 보낼 별도 콘솔이 필요하므로 새 콘솔을 만들되,
+                # STARTF_USESHOWWINDOW로 창 표시만 숨깁니다. FFmpeg에는 이 설정을
+                # 적용하지 않고 _run_ffmpeg의 CREATE_NO_WINDOW만 사용합니다.
                 startup = subprocess.STARTUPINFO()
                 startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 startup.wShowWindow = 0
                 kwargs['startupinfo'] = startup
                 kwargs['creationflags'] = CREATE_NEW_CONSOLE
-            proc = subprocess.Popen(
-                cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL, **kwargs)
+            proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, **kwargs)
             self.proc = proc
         except OSError as e:
-            self.recording_finished.emit('error', f'scrcpy 실행 실패:\n{e}')
+            self.recording_finished.emit('finalized_error', f'scrcpy 실행 실패:\n{e}')
             return
 
-        self.proc_started_at = time.time()
-
+        self.proc_started_at = time.monotonic()
         def pump_output():
             try:
                 with open(log_path, 'w', encoding='utf-8', errors='replace') as log_file:
@@ -400,59 +439,54 @@ class ScreenRecorder(QtWidgets.QWidget):
                             log_file.flush()
             except OSError as e:
                 tail.append(f'로그 파일 저장 실패: {e}')
-
         reader = threading.Thread(target=pump_output, daemon=True)
         reader.start()
         return_code = proc.wait()
         reader.join(timeout=3)
-
-        forced = self._forced_kill
-        self._forced_kill = False
         exists = os.path.isfile(out_path) and os.path.getsize(out_path) > 0
         detail = '\n'.join(tail) or '(scrcpy 출력 없음)'
-
         if exists and return_code == 0:
-            msg = (f'저장 완료:\n{out_path}\n\n'
-                   f'오디오 방식: {audio_mode}\n'
-                   f'실행 로그: {log_path}')
-            if forced and out_path.lower().endswith('.mp4'):
-                msg += ('\n\n※ scrcpy를 강제로 종료했습니다. MP4가 손상됐을 수 있습니다.\n'
-                        '가능하면 다음 녹화부터 MKV 형식을 사용하세요.')
-            self.recording_finished.emit('ok', msg)
+            self.recording_finished.emit('raw_ready', f'{out_path}\n{log_path}')
         else:
-            reason = f'scrcpy 종료 코드: {return_code}'
-            self.recording_finished.emit(
-                'error',
-                f'녹화가 정상 완료되지 않았습니다.\n{reason}\n\n'
-                f'로그 파일: {log_path}\n\n최근 출력:\n{detail}')
+            self.recording_finished.emit('finalized_error',
+                f'녹화가 정상 완료되지 않았습니다. 종료 코드: {return_code}\n로그: {log_path}\n\n최근 출력:\n{detail}')
 
     def update_clock(self):
-        if not self.recording or self.stop_requested:
+        if not self.recording:
             return
-        sec = int(time.time() - self.rec_started_at)
-        self.status_label.setText(
-            f'🔴 녹화 중... {sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}')
+        elapsed = self._elapsed_now()
+        # 일시정지 구간을 제외한 유효 녹화 시간 표시. monotonic 시계를 사용해 시스템 시각 변경의 영향을 받지 않음.
+        paused_total = sum(max(0.0, end - start) for start, end in self._pause_intervals)
+        if self.paused and self._pause_started_at is not None:
+            paused_total += max(0.0, elapsed - self._pause_started_at)
+        active = max(0.0, elapsed - paused_total)
+        sec = int(active)
+        if sec != self._last_display_second:
+            state = '⏸️ 일시 정지' if self.paused else '🔴 녹화 중...'
+            self.status_label.setText(f'{state} {self._format_elapsed(active)}')
+            self._last_display_second = sec
 
     def stop_recording(self):
         if not self.recording or self.stop_requested:
             return
+        if self.paused and self._pause_started_at is not None:
+            self._pause_intervals.append((self._pause_started_at, self._elapsed_now()))
+            self._pause_started_at = None
         self.stop_requested = True
+        self.pause_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
-        self.status_label.setText('💾 저장 중...')
+        self.status_label.setText('💾 녹화 종료 및 저장 중...')
         threading.Thread(target=self._stop_worker, daemon=True).start()
 
     def _stop_worker(self):
-        # scrcpy 시작 직후라면 프로세스가 생성될 때까지 기다립니다.
-        deadline = time.time() + 15
+        deadline = time.monotonic() + 15
         while self.proc is None:
-            if not self.recording or time.time() >= deadline:
+            if not self.recording or time.monotonic() >= deadline:
                 return
             time.sleep(0.05)
-
-        wait = MIN_RUN_BEFORE_STOP - (time.time() - self.proc_started_at)
+        wait = MIN_RUN_BEFORE_STOP - (time.monotonic() - self.proc_started_at)
         if wait > 0:
             time.sleep(wait)
-
         proc = self.proc
         if proc is None or proc.poll() is not None:
             return
@@ -466,28 +500,177 @@ class ScreenRecorder(QtWidgets.QWidget):
             self._forced_kill = True
             proc.kill()
 
+    def _begin_finalize(self):
+        pass
+
+    def _resolve_ffmpeg(self):
+        """FFmpeg를 찾고, PyInstaller 임시 폴더에서 직접 실행하지 않도록 영구 폴더로 복사합니다."""
+        exe_name = 'ffmpeg.exe' if IS_WIN else 'ffmpeg'
+        roots = []
+        if getattr(sys, 'frozen', False):
+            roots.append(os.path.join(getattr(sys, '_MEIPASS', ''), 'ffmpeg', 'bin'))
+        roots.append(os.path.join(app_dir(), 'ffmpeg', 'bin'))
+        roots.append(os.path.join(app_dir(), 'ffmpeg'))
+        source = next((os.path.join(root, exe_name) for root in roots
+                       if os.path.isfile(os.path.join(root, exe_name))), None)
+        if not source:
+            return shutil.which('ffmpeg')
+        if not getattr(sys, 'frozen', False):
+            return source
+        base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+        target_dir = os.path.join(base, 'ADBRecorder', 'ffmpeg')
+        target = os.path.join(target_dir, exe_name)
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            if (not os.path.isfile(target) or
+                    os.path.getsize(target) != os.path.getsize(source)):
+                shutil.copyfile(source, target)
+            # FFmpeg 실행 폴더의 DLL도 함께 복사합니다.
+            for name in os.listdir(os.path.dirname(source)):
+                src_file = os.path.join(os.path.dirname(source), name)
+                if os.path.isfile(src_file) and name.lower().endswith('.dll'):
+                    dst_file = os.path.join(target_dir, name)
+                    if not os.path.isfile(dst_file) or os.path.getsize(dst_file) != os.path.getsize(src_file):
+                        shutil.copyfile(src_file, dst_file)
+            return target
+        except OSError:
+            # 임시 폴더 실행을 피할 수 없으면 원본 경로를 반환하되 실행 오류를 보여줍니다.
+            return source
+
+    @staticmethod
+    def _run_ffmpeg(cmd):
+        """FFmpeg를 실행하되 Windows 콘솔 창을 표시하지 않습니다."""
+        kwargs = {
+            'stdout': subprocess.PIPE,
+            'stderr': subprocess.PIPE,
+            'text': True,
+            'errors': 'replace',
+            'timeout': 24 * 60 * 60,
+        }
+        if IS_WIN:
+            # CREATE_NO_WINDOW 자체로 콘솔 생성을 막습니다.
+            # STARTUPINFO/STARTF_USESHOWWINDOW를 함께 지정하면 일부 Windows/PyInstaller
+            # 환경에서 자식 프로세스의 표준 핸들이 유효하지 않게 되어 WinError 6이
+            # 발생할 수 있으므로 startupinfo는 전달하지 않습니다.
+            kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+            # FFmpeg가 실행 파일 옆 DLL을 찾을 수 있도록 실행 폴더를 지정합니다.
+            kwargs['cwd'] = os.path.dirname(os.path.abspath(cmd[0]))
+        return subprocess.run(cmd, **kwargs)
+
+    def _finalize_worker(self):
+        raw_path = self._current_segment_path
+        final_path = self._base_out_path
+        if not raw_path or not os.path.isfile(raw_path) or os.path.getsize(raw_path) == 0:
+            self.recording_finished.emit('finalized_error', '원본 녹화 파일이 없습니다. 원본 파일과 로그를 확인하세요.')
+            return
+        if not self._pause_intervals:
+            try:
+                # 일시정지가 없으면 FFmpeg 재인코딩 없이 파일 데이터만 복사합니다.
+                temp = final_path + '.tmp' + os.path.splitext(final_path)[1]
+                shutil.copyfile(raw_path, temp)
+                os.replace(temp, final_path)
+                self.recording_finished.emit('finalized_ok', f'녹화 저장 완료:\n{final_path}\n\n일시정지 구간: 없음')
+            except Exception as e:
+                self.recording_finished.emit('finalized_error', f'최종 파일 저장 실패: {e}\n원본 보존: {raw_path}')
+            return
+
+        ffmpeg = self._resolve_ffmpeg()
+        if not ffmpeg:
+            self.recording_finished.emit('finalized_error', f'FFmpeg를 찾을 수 없습니다. ffmpeg\\bin\\ffmpeg.exe를 내장하세요.\n원본 보존: {raw_path}')
+            return
+        try:
+            total = self._elapsed_now()
+            # 마지막 pause interval은 stop_recording에서 닫힘. 각 pause 구간을 제외한 부분만 남김.
+            pauses = sorted((max(0.0, a), min(total, b)) for a, b in self._pause_intervals if b > a)
+            active = []
+            cursor = 0.0
+            for a, b in pauses:
+                a = max(cursor, a)
+                if a > cursor + 0.08:
+                    active.append((cursor, a))
+                cursor = max(cursor, b)
+            if total > cursor + 0.08:
+                active.append((cursor, total))
+            if not active:
+                raise RuntimeError('저장할 녹화 구간이 없습니다. 일시정지 상태와 녹화 시간을 확인하세요.')
+
+            # concat filter로 비디오/오디오를 같은 구간에서 자르고 재인코딩합니다.
+            filters = []
+            labels = []
+            for i, (a, b) in enumerate(active):
+                filters.append(f'[0:v:0]trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS[v{i}]')
+                if self.keep_device_audio_check.isChecked():
+                    filters.append(f'[0:a:0]atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS[a{i}]')
+                labels.append(f'[v{i}]')
+                if self.keep_device_audio_check.isChecked():
+                    labels.append(f'[a{i}]')
+            if self.keep_device_audio_check.isChecked():
+                inputs = ''.join(f'[v{i}][a{i}]' for i in range(len(active)))
+                filters.append(f'{inputs}concat=n={len(active)}:v=1:a=1[outv][outa]')
+            else:
+                filters.append(''.join(f'[v{i}]' for i in range(len(active))) + f'concat=n={len(active)}:v=1:a=0[outv]')
+            temp_final = final_path + '.processing' + os.path.splitext(final_path)[1]
+            cmd = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-y', '-i', raw_path,
+                   '-filter_complex', ';'.join(filters), '-map', '[outv]']
+            if self.keep_device_audio_check.isChecked():
+                cmd += ['-map', '[outa]', '-c:a', 'aac', '-b:a', '192k']
+            cmd += ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18']
+            if final_path.lower().endswith('.mp4'):
+                cmd += ['-movflags', '+faststart']
+            cmd += [temp_final]
+            result = self._run_ffmpeg(cmd)
+            if result.returncode != 0:
+                raise RuntimeError((result.stderr or 'FFmpeg가 구간을 자르지 못했습니다.')[-5000:])
+            if not os.path.isfile(temp_final) or os.path.getsize(temp_final) == 0:
+                raise RuntimeError('FFmpeg 결과 파일이 비어 있습니다.')
+            os.replace(temp_final, final_path)
+            try:
+                os.remove(raw_path)
+            except OSError:
+                pass
+            self.recording_finished.emit('finalized_ok',
+                f'녹화 저장 완료:\n{final_path}\n\n일시정지 구간 {len(pauses)}개를 제거했습니다.\n원본 파일은 최종 저장 후 정리했습니다.')
+        except Exception as e:
+            self.recording_finished.emit('finalized_error',
+                f'최종 파일 저장 중 오류가 발생했습니다.\n{e}\n\n원본 녹화 파일은 보존했습니다:\n{raw_path}')
+
     def on_recording_finished(self, kind, message):
-        self.clock.stop()
-        self.recording_end()
-        if kind == 'ok':
+        if kind == 'raw_ready':
+            self.proc = None
+            self.status_label.setText('💾 일시정지 구간 제거 및 저장 중...')
+            threading.Thread(target=self._finalize_worker, daemon=True).start()
+            return
+        if kind == 'finalized_ok':
+            self.clock.stop()
+            self.recording_end()
             QtWidgets.QMessageBox.information(self, '완료', message)
-        else:
+            return
+        if kind == 'finalized_error':
+            self.clock.stop()
+            self.recording_end()
             QtWidgets.QMessageBox.warning(self, '오류', message)
+            return
 
     def recording_end(self):
         self.recording = False
+        self.paused = False
         self.stop_requested = False
         self.proc = None
+        self._segment_started_at = 0.0
+        self._timeline_start = 0.0
+        self._pause_started_at = None
         self.status_label.setText('⏹️ 대기 중')
         self.status_label.setStyleSheet('color: black; font-size: 16px;')
         self.start_btn.setEnabled(True)
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.setText('일시 정지')
         self.stop_btn.setEnabled(False)
         self.keep_device_audio_check.setEnabled(True)
 
     def closeEvent(self, event):
         if self.recording:
             self.stop_recording()
-            deadline = time.time() + GRACEFUL_STOP_TIMEOUT + 5
+            deadline = time.time() + GRACEFUL_STOP_TIMEOUT + 24 * 60 * 60
             while self.recording and time.time() < deadline:
                 QtWidgets.QApplication.processEvents()
                 time.sleep(0.05)
