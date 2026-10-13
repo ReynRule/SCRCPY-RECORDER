@@ -308,7 +308,7 @@ class ScreenRecorder(QtWidgets.QWidget):
         except (OSError, subprocess.SubprocessError):
             return
 
-        previous_device = self.device_combo.currentText()
+        previous_
 
         self.device_combo.clear()
 
@@ -332,7 +332,7 @@ class ScreenRecorder(QtWidgets.QWidget):
             return
         adb = self.resolve_adb()
         scrcpy = self.resolve_scrcpy()
-        device = self.device_combo.currentText()
+        device = self.device_combo.currentData()
         if not adb or not device:
             QtWidgets.QMessageBox.warning(self, '오류', 'ADB 경로나 디바이스를 확인하세요. 에뮬레이터를 켠 뒤 새로고침하세요.')
             return
